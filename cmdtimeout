@@ -1,0 +1,360 @@
+#!/usr/bin/env python
+'''
+    Copyright (c) 2017 Timothy Savannah under terms of GPLv3
+
+    cmdtimeout - Execute a command within the confines of a timeout
+'''
+
+# vim: set ts=4 sw=4 st=4 expandtab :
+
+import os
+import signal
+import sys
+import subprocess
+import threading
+import time
+import re
+
+__version__ = '1.0.0'
+
+__version_tuple__ = (1, 0, 0)
+
+# GRACE_TIME_NEED_CALC - Temp value used when graceTime is provided as 
+#   just -g or --graceful and must be calculated once "timeout" is known
+GRACE_TIME_NEED_CALC = 'NEED_CALC'
+
+# EXIT_CODE_ARG_ERROR - Exit code when a required argment is missing
+EXIT_CODE_ARG_ERROR = 250
+
+# EXIT_CODE_ARG_VALUE_ERROR - Exit code when an argument has wrong format
+#  or is otherwise invalid
+EXIT_CODE_ARG_VALUE_ERROR = 251
+
+# EXIT_CODE_KILLED - Exit code when timeout is exceeded and cmd
+#  must be killed
+EXIT_CODE_KILLED = 180
+
+# EXIT_CODE_UNKNOWN - When something unknown happens and we don't
+#   gather a return code
+EXIT_CODE_UNKNOWN = 254
+
+
+def printUsage(extendedHelp=False):
+    basename = os.path.basename(sys.argv[0])
+    sys.stderr.write('''Usage %s (Options) [num seconds] -- [cmd] ([cmd args])
+   Runs specfied command, with a given maximum timeout.
+
+''' %(basename, ))
+    if extendedHelp is False:
+        sys.stderr.write('Give --help or -h before the "--" to see the full help, including %s optoins.\n\n' %(basename, ))
+    else:
+        sys.stderr.write('''
+The arguments and options to %s should precede two dashes '--',
+  after which everything is executed.
+
+   Options:
+
+     -g(=N)  --graceful(=N)    Instead of sending SIGKILL after timeout,
+                                 send SIGTERM and wait a few seconds.
+                               You can provide the seconds between signals as N.
+                               Default is to wait the smaller of: 10%% of timeout, or 5 seconds,
+
+     -s      --shell           Execute the command through a shell
+
+     -?      --help            Show this message
+
+
+Example:    %s  -g 5 20 -- ./doWork --database=mydb.db
+  Gives "doWork" 20 seconds to complete, otherwise 
+  SIGTERM and allows 5 seconds before forcing KILL.
+
+''' %(basename, basename)
+)
+
+
+class BoolObj(object):
+    '''
+        BoolObj - A boolean which can be used by reference
+    '''
+    
+    def __init__(self, value):
+        self.value = value
+
+    def setValue(self, value):
+        self.value = value
+
+    def getValue(self):
+        return self.value
+
+    def __call__(self):
+        return self.value
+
+ALL_SIGNALS = (signal.SIGABRT, signal.SIGALRM, signal.SIGBUS, signal.SIGFPE, signal.SIGHUP, 
+            signal.SIGILL, signal.SIGINT, signal.SIGIO, signal.SIGIOT, signal.SIGPWR,
+            signal.SIGQUIT, signal.SIGSYS, signal.SIGTERM, signal.SIGSYS, signal.SIGTRAP,
+            signal.SIGTSTP, signal.SIGUSR1, signal.SIGUSR2)
+
+
+if __name__ == '__main__':
+
+    args = sys.argv[1:]
+
+    if len(args) < 1:
+        printUsage(extendedHelp=False)
+        sys.exit(EXIT_CODE_ARG_ERROR)
+
+    if '--' not in args:
+        if '--help' in args or '-?' in args:
+            printUsage(extendedHelp=True)
+            sys.exit(0)
+
+        sys.stderr.write('Missing "--" in argument list, which precedes the command and arguments to execute.\n\n')
+        sys.exit(EXIT_CODE_ARG_ERROR)
+    
+    ddIndex = args.index('--')
+
+    myArgs = args[ : ddIndex]
+
+    cmdAndArgs = args[ddIndex + 1 : ]
+
+    if not myArgs:
+        sys.stderr.write('Missing timeout seconds.\n\n')
+        printUsage(extendedHelp=False)
+        sys.exit(EXIT_CODE_ARG_ERROR)
+
+    if not cmdAndArgs:
+        sys.stderr.write('No command given after "--".\n\n')
+        printUsage(extendedHelp=False)
+    
+
+    # Options determined by argument
+    timeout = None
+    doShell = False
+    graceTime = None
+
+    numArgs = len(myArgs)
+
+    # Parse args
+    for i in range(numArgs):
+        arg = myArgs[i]
+        if arg in ('--help', '-?'):
+
+            printUsage(extendedHelp=True)
+            sys.exit(0)
+
+        elif arg in ('-s', '--shell'):
+
+            doShell = True
+
+        elif arg.startswith( ('-g', '--graceful') ):
+            # Match as blank or as =N
+            matchObj = re.match('^(-g|--graceful)(=(?P<grace_time>[0-9]+)){0,1}$', arg)
+            if not matchObj:
+                if '=' not in arg:
+                    sys.stderr.write('Tried to give number of grace seconds, but missing " = " sign.\n')
+                    sys.exit(EXIT_CODE_ARG_VALUE_ERROR)
+                else:
+                    sys.stderr.write('Unknown error trying to parse grace time argument.\n')
+                    sys.exit(EXIT_CODE_ARG_VALUE_ERROR)
+
+            groupDict = matchObj.groupdict()
+            
+            # graceTime is present when =N
+            graceTime = groupDict.get('grace_time', None)
+            if graceTime:
+                try:
+                    graceTime = float(graceTime)
+                except:
+                    sys.stderr.write('Provided grace time, %s is not a number!\n' %(graceTime, ))
+                    sys.exit(EXIT_CODE_ARG_VALUE_ERROR)
+            else:
+                # Otherwise, defer calc until we extract "timeout" from given args
+                graceTime = GRACE_TIME_NEED_CALC
+        else:
+            if timeout:
+                # If we've already had a bare arg or unknown option
+                sys.stderr.write('Too many arguments before "--", or unknown options.\n\n')
+                printUsage(extendedHelp=True)
+                sys.exit(EXIT_CODE_ARG_ERROR)
+
+            timeout = arg
+
+    if timeout is None:
+        sys.stderr.write('No tiemout provided.\n\n')
+        printUsage(extendedHelp=False)
+        sys.exit(EXIT_CODE_ARG_ERROR)
+
+    try:
+        timeout = float(timeout)
+    except:
+        sys.stderr.write('Provided timeout, "%s" is not a number.\n' %( timeout, ))
+        printUsage(extendedHelp=False)
+        sys.exit(EXIT_CODE_ARG_VALUE_ERROR)
+
+    if graceTime == GRACE_TIME_NEED_CALC:
+        graceTime = min ( timeout / 10.0, 5 )
+
+
+    # TODO: Defer signals
+
+    global exitcode
+    exitcode = None
+    
+
+    stopRunning = BoolObj(False)
+
+    global pipe
+    pipe = None
+
+    def do_watch_timeout(pipe, timeout, graceTime, stopRunning):
+        '''
+            The thread runs here. This watches for timeout expiration while main thread calls .wait
+
+               Sets "exitcode" if determined.
+
+               @param pipe <subprocess.Popen> - Process pipe
+
+               @param timeout <float> - Seconds to allow process to execute
+
+               @param graceTime <None/float> - If None, straight to SIGKILL. Otherwise, will SIGTERM and wait
+                 this many seconds.
+
+               @param stopRunning <BoolObj> - Terminator, will be set to True if we should stop watching
+                  using this thread.
+
+                Globals:
+                   May sets 'exitcode'
+        '''
+        global exitcode
+
+        pollTime = timeout / 20.0
+        if pollTime < .1:
+            pollTime = .1
+
+        startTime = time.time()
+        now = time.time()
+
+        while not stopRunning() and ( now - startTime < timeout ):
+            _exitcode = pipe.poll()
+            if _exitcode is not None:
+                exitcode = _exitcode
+                return
+
+            time.sleep(pollTime)
+            now = time.time()
+
+        # We passed timeout here
+
+        if not stopRunning():
+            # If we were not asked to stop, subprocess should be terminated.
+            exitcode = EXIT_CODE_KILLED
+            if graceTime:
+                pollTime = graceTime / 20.0
+                if graceTime < .05:
+                    pollTime = .05
+
+                # Support multiple versions of python and configurations
+                try:
+                    if hasattr(pipe, 'terminate'):
+                        pipe.terminate()
+                    elif hasattr(pipe, 'send_signal'):
+                        pipe.send_signal(signal.SIGTERM)
+                    else:
+                        os.kill(pipe.pid, signal.SIGTERM)
+                except:
+                    return
+
+                startTime = time.time()
+                now = time.time()
+                while not stopRunning() and ( now - startTime < graceTime ):
+                    _exitcode = pipe.poll()
+                    if _exitcode is not None:
+                        return
+                    
+                    time.sleep(pollTime)
+                    now = time.time()
+
+                try:
+                    if hasattr(pipe, 'kill'):
+                        pipe.kill()
+                    elif hasattr(pipe, 'send_signal'):
+                        pipe.send_signal(signal.SIGKILL)
+                    else:
+                        os.kill(pipe.pid, signal.SIGKILL)
+                except:
+                    return
+
+        return
+            
+
+    # If doShell, convert out command to a quoted shell expression (to allow things like "expr" to be used)
+    if doShell is True:
+        cmdAndArgs = ' '.join(['"' + part.replace('\\', '\\\\').replace('$', '\\$').replace('"', '\\"') + '"' for part in cmdAndArgs])
+
+    # Kick off the subprocess
+    pipe = subprocess.Popen(cmdAndArgs, shell=doShell)
+
+    def handle_signal(signum, *args, **kwargs):
+        '''
+            handle_signal - Pass the given signal along to the pipe
+
+            @param signum <int> - signal number
+
+            Uses global: pipe
+        '''
+        global pipe
+        print ( "Forwarding signal %d to %d" %(signum, pipe.pid))
+        pipe.send_signal(signum)
+        return False
+ 
+
+    # Set all signals to send to pipe
+    for signum in ALL_SIGNALS:
+        signal.signal(signum, handle_signal)
+
+    # Start watcher thread
+    thread = threading.Thread(target=do_watch_timeout, args=(pipe, timeout, graceTime, stopRunning))
+    thread.start()
+
+    # ret - The returncode extracted by main app (program exited in time)
+    ret = None
+
+    pollTime = timeout / 20.0
+    if pollTime > .1:
+        pollTime = .1
+
+    while ret is None and exitcode is None:
+        try:
+            ret = pipe.poll()
+            time.sleep(pollTime)
+        except:
+            pass
+        
+
+    if not exitcode:
+        # App must have terminated in time, so signal the watcher thread to stop
+        stopRunning.setValue(True)
+
+    # Return signals to their default state
+    for signum in ALL_SIGNALS:
+        signal.signal(signum, signal.SIG_DFL)
+
+    # Collect the watcher thread
+    thread.join()
+
+
+    # If we killed, always return EXIT_CODE_KILLED even if the app
+    #   returned a different code during a graceful shutdown.
+    if exitcode == EXIT_CODE_KILLED:
+        sys.exit(EXIT_CODE_KILLED)
+
+    # Otherwise, if successful return code, use that
+    if ret:
+        sys.exit(ret)
+    # Otherwise, if we gathered a successful return code from the watcher thread, use that
+    elif exitcode is not None:
+        sys.exit(exitcode)
+    # Otherwise, unknown. This shouldn't happen.
+    else:
+        sys.exit(254)
+
