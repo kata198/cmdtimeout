@@ -1,4 +1,6 @@
-# cmdtimeout
+cmdtimeout
+==========
+
 Execute an arbitrary command with a maximum given timeout
 
 
@@ -26,25 +28,39 @@ Extended Help
 -------------
 
 	Usage cmdtimeout (Options) [num seconds] -- [cmd] ([cmd args])
+
 	   Runs specfied command, with a given maximum timeout.
 
 
+
 	The arguments and options to cmdtimeout should precede two dashes '--',
+
 	  after which everything is executed.
+
 
 	   Options:
 
+
 		 -g(=N)  --graceful(=N)    Instead of sending SIGKILL after timeout,
+
 									 send SIGTERM and wait a few seconds.
+
 								   You can provide the seconds between signals as N.
+
 								   Default is to wait the smaller of: 10% of timeout, or 5 seconds,
 
+
 		 -s      --shell           Execute the command through a shell
+
 
 		 -?      --help            Show this message
 
 
+
 	Example:    cmdtimeout  -g 5 20 -- ./doWork --database=mydb.db
+
 	  Gives "doWork" 20 seconds to complete, otherwise 
+
 	  SIGTERM and allows 5 seconds before forcing KILL.
+
 
