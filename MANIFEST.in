@@ -1,0 +1,4 @@
+include README.md
+include README.rst
+include cmdtimeout
+include setup.py
