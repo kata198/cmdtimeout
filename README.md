@@ -9,7 +9,9 @@ The command is sent SIGKILL (or, if on windows, the equivilant) which forcibly s
 
 **Graceful Kill (-g)**
 
-In graceful mode, if the alloted time passes before the application completes, it is sent SIGTERM (or, if on windows, the equivilant), and then given a short time (configurable) to cleanup and shut down itself. If the grace time passes and the application still has not stopped, the kill switch is thrown.
+In graceful mode, if the alloted time passes before the application completes, it is sent SIGTERM (or, if on windows, the equivilant), and then given a short time (configurable) to cleanup and exit.
+
+If the grace time passes and the application still has not stopped, the kill switch is thrown.
 
 
 Example Usage
