@@ -323,38 +323,52 @@ if __name__ == '__main__':
     if pollTime > .1:
         pollTime = .1
 
-    while ret is None and exitcode is None:
+    try:
+        while ret is None and exitcode is None:
+            try:
+                ret = pipe.poll()
+                time.sleep(pollTime)
+            except:
+                pass
+
+
+        if not exitcode:
+            # App must have terminated in time, so signal the watcher thread to stop
+            stopRunning.setValue(True)
+
+        # Return signals to their default state
+        for signum in ALL_SIGNALS:
+            signal.signal(signum, signal.SIG_DFL)
+
+        # Collect the watcher thread
+        thread.join()
+
+
+        # If we killed, always return EXIT_CODE_KILLED even if the app
+        #   returned a different code during a graceful shutdown.
+        if exitcode == EXIT_CODE_KILLED:
+            sys.exit(EXIT_CODE_KILLED)
+
+        # Otherwise, if successful return code, use that
+        if ret:
+            sys.exit(ret)
+        # Otherwise, if we gathered a successful return code from the watcher thread, use that
+        elif exitcode is not None:
+            sys.exit(exitcode)
+    except SystemExit as sExitCode:
+        # Explicitly catch SystemExit and push it along, so that we can trap BaseException below
+        #   (instead of just Exception)
+        sys.exit(sExitCode)
+    except BaseException as e:
         try:
-            ret = pipe.poll()
-            time.sleep(pollTime)
+            sys.stderr.write('Unknown Exception: <%s>:   %s\n' %(e.__class__.__name__, str(e)))
+            exc_info = sys.exc_info()
+            traceback.print_exception(*exc_info)
+            sys.exit(EXIT_CODE_UNKNOWN)
         except:
-            pass
-        
-
-    if not exitcode:
-        # App must have terminated in time, so signal the watcher thread to stop
-        stopRunning.setValue(True)
-
-    # Return signals to their default state
-    for signum in ALL_SIGNALS:
-        signal.signal(signum, signal.SIG_DFL)
-
-    # Collect the watcher thread
-    thread.join()
-
-
-    # If we killed, always return EXIT_CODE_KILLED even if the app
-    #   returned a different code during a graceful shutdown.
-    if exitcode == EXIT_CODE_KILLED:
-        sys.exit(EXIT_CODE_KILLED)
-
-    # Otherwise, if successful return code, use that
-    if ret:
-        sys.exit(ret)
-    # Otherwise, if we gathered a successful return code from the watcher thread, use that
-    elif exitcode is not None:
-        sys.exit(exitcode)
+            sys.exit(EXIT_CODE_UNKNOWN)
     # Otherwise, unknown. This shouldn't happen.
-    else:
-        sys.exit(254)
+    sys.exit(EXIT_CODE_UNKNOWN)
+
+
 
