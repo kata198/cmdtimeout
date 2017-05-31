@@ -3,11 +3,8 @@
  *
  * Not licensed by any means yet, private code until in better state.
  *
- * TODO: -O2 seems to break. This is because it optimizes-out "sharedData",
- *        which then fails after fork.
  * TODO: Lots of cleanups, consolidations
  * TODO :Better fixups with shebang
- * TODO :search PATH
 */
 #include <features.h>
 #include <stdio.h>
@@ -74,9 +71,13 @@ void printUsage(void)
 /* CHILD_NO_EXIT_CODE - An impossible exit code to mark that we have not got one from child  */
 #define CHILD_NO_EXIT_CODE ( 300 )
 
-#define USEC_TO_SECONDS 1000000
+#define USEC_TO_SECONDS 1000000.0
 
 #define convertSecondsToUsec(x) ( (x) * USEC_TO_SECONDS )
+
+#define NSEC_TO_SECONDS 1000000000.0
+
+#define convertSecondsToNsec(x) ( (x) * NSEC_TO_SECONDS )
 
 #define FORCE_DONT_OPTIMIZE( x ) __asm__ __volatile__("" :: "m" ( ( x ) ))
 #ifdef __GNUC__
@@ -151,8 +152,6 @@ static inline void markChildStarted(volatile SharedData *sharedData)
     sharedData->childIsStarted = 1;
     msync( (SharedData *)sharedData, sizeof(SharedData) + 1, MS_SYNC);
 }
-
-#define INITIAL_KEY_BUFFER 4096
 
 static char *findEnvironVar(char *name)
 {
@@ -295,16 +294,16 @@ checkpath_exit:
 
 }
 
-static pid_t strtoint(char *str)
+static double strtodouble(char *str)
 {
-    pid_t ret;
+    double ret;
     char *endptr = { 0 };
 
     errno = 0;
 
     if ( *str )
     {
-        ret = strtol(str, &endptr, 10);
+        ret = strtod(str, &endptr);
     }
     else
     {
@@ -370,12 +369,52 @@ static char *getShebang(char *filename, int *errorCode)
     return ret;
 }
 
+static inline double clockdiff(struct timespec *start, struct timespec *end)
+{
+    double diffTime;
+
+    diffTime = (end->tv_sec - start->tv_sec) + ( (end->tv_nsec - start->tv_nsec) / NSEC_TO_SECONDS );
+
+/*    printf("diffTime is: %lf\n", diffTime); */
+
+    return diffTime;
+}
+
+static inline struct timespec secondsToTimespec(double seconds)
+{
+    struct timespec sleepTime;
+    sleepTime.tv_sec = (long int)seconds;
+
+    seconds -= (long int)seconds;
+
+    sleepTime.tv_nsec = convertSecondsToNsec(seconds);
+
+    return sleepTime;
+}
+
+    
+
+static inline void sleepTimespec(struct timespec *sleepTime)
+{
+    nanosleep(sleepTime, NULL);
+}
+
+static inline void sleepSeconds(double seconds)
+{
+    struct timespec sleepTime;
+
+    sleepTime = secondsToTimespec(seconds);
+
+    sleepTimespec(&sleepTime);
+
+}
+
 int main(int argc, char* argv[])
 {
     int i;
 
     double timeoutSeconds = -1.0;
-    int gracefulTimeout = GRACEFUL_NONE;
+    double gracefulTimeout = GRACEFUL_NONE;
 
     char **cmdMarker = NULL;
     char *tmp;
@@ -399,9 +438,13 @@ int main(int argc, char* argv[])
             }
             else
             {
-                /* TODO: Use my strtoint function*/
                 errno = 0;
-                gracefulTimeout = atoi(tmp+1);
+                gracefulTimeout = strtodouble(tmp+1);
+                if ( errno != 0 )
+                {
+                    fprintf(stderr, "Provided graceful timeout is not a valid floating-point number. Got: %s\n", argv[i]);
+                    return EXIT_CODE_ARG_VALUE_ERROR;
+                }
             }
         }
         else if ( strcmp("--", argv[i]) == 0 )
@@ -425,7 +468,7 @@ int main(int argc, char* argv[])
                 return EXIT_CODE_ARG_ERROR;
             }
 
-            timeoutSeconds = strtoint(argv[i]);
+            timeoutSeconds = strtodouble(argv[i]);
             if ( errno )
             {
                 fprintf(stderr, "Invalid argument, expected [timeout seconds] to be a float. Got: %s\n", argv[i]);
@@ -534,7 +577,6 @@ int main(int argc, char* argv[])
         {
             fputs("Failed to launch program!\n", stderr); 
         }
-        fputs("Here?\n", stderr);
         return EXIT_CODE_FAILED_LAUNCH; 
     }
     else
@@ -542,52 +584,51 @@ int main(int argc, char* argv[])
         int exitStatus;
         double pollTime;
 
-        time_t startTime;
+        struct timespec startTime;
+        struct timespec curTime;
 
-        useconds_t sleepUsec;
+        struct timespec sleepTime;
 
         int waitPidRet;
 
 
         setChildPid( sharedData, childPid);
 
+
         do {
-            usleep ( convertSecondsToUsec( .01 ) );
+            sleepSeconds( .01 );
         } while ( ! sharedData->childIsStarted );
 
-        startTime = time(NULL);
 
-        usleep ( convertSecondsToUsec( .5 ) );
+        clock_gettime( CLOCK_REALTIME, &startTime);
 
         pollTime = timeoutSeconds / 20.0;
         if ( pollTime > .1 )
             pollTime = .1;
 
-        char *tmpBuff = calloc(1, 256);
-        sprintf(tmpBuff, "ps aux | grep %d", childPid);
 
-        sleepUsec = convertSecondsToUsec( pollTime );
+        sleepTime = secondsToTimespec( pollTime );
         do
         {
-            usleep ( sleepUsec );
+            sleepTimespec(&sleepTime);
+            clock_gettime( CLOCK_REALTIME, &curTime);
             errno = 0;
             waitPidRet = waitpid( childPid, &exitStatus, WNOHANG );
             if ( waitPidRet == 0 )
                 continue;
-            if ( waitPidRet < 0 )
-            {
-                printf("waitpid returned error: %s\n", strerror(errno));
-                exitCode = EXIT_CODE_UNKNOWN;
-                goto cleanup_and_exit;
-            }
             if ( WIFEXITED(exitStatus) )
             {
                 exitCode = WEXITSTATUS(exitStatus);
 /*                printf ( "Exited with code: %d\n", exitCode); */
                 goto cleanup_and_exit;
             }
+            else if ( waitPidRet < 0 )
+            {
+                exitCode = EXIT_CODE_UNKNOWN;
+                goto cleanup_and_exit;
+            }
 
-        } while ( ( time(NULL) - startTime ) < timeoutSeconds );
+        } while ( clockdiff(&startTime, &curTime) < timeoutSeconds );
 
 /*        printf(" After loop.\n" ); */
         exitCode = EXIT_CODE_KILLED;
@@ -601,30 +642,28 @@ int main(int argc, char* argv[])
         pollTime = gracefulTimeout / 20.0;
         if ( pollTime > .1 )
             pollTime = .1;
-        sleepUsec = convertSecondsToUsec( pollTime );
 
         kill(childPid, SIGTERM);
 
-        startTime = time(NULL);
+        sleepTime = secondsToTimespec( pollTime );
+        clock_gettime( CLOCK_REALTIME, &startTime);
         do
         {
-            usleep ( sleepUsec);
+            sleepTimespec(&sleepTime);
+            clock_gettime( CLOCK_REALTIME, &curTime);
             waitPidRet = waitpid( childPid, &exitStatus, WNOHANG );
             if ( waitPidRet == 0 )
                 continue;
-            if ( waitPidRet < 0 )
-            {
-                printf("waitpid returned error: %s\n", strerror(errno));
-                exitCode = EXIT_CODE_UNKNOWN;
-                goto cleanup_and_exit;
-            }
             if ( WIFEXITED(exitStatus) )
             {
-                exitCode = WEXITSTATUS(exitStatus);
+                goto cleanup_and_exit;
+            }
+            else if(waitPidRet < 0)
+            {
                 goto cleanup_and_exit;
             }
 
-        } while ( (time(NULL) - startTime) < gracefulTimeout );
+        } while ( clockdiff(&startTime, &curTime) < gracefulTimeout );
 
         kill(childPid, SIGKILL);
 
